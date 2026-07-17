@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: grc-postgres
+    environment:
+      POSTGRES_USER: ${DATABASE_USER:-grc_user}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-grc_password}
+      POSTGRES_DB: ${DATABASE_NAME:-grcdb}
+    ports:
+      - "${DATABASE_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-grc_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - grc-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: grc-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - grc-network
+
+  # Keycloak (Identity & Access Management)
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: grc-keycloak
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${DATABASE_NAME:-grcdb}
+      KC_DB_USERNAME: ${DATABASE_USER:-grc_user}
+      KC_DB_PASSWORD: ${DATABASE_PASSWORD:-grc_password}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: start-dev
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    networks:
+      - grc-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: grc-backend
+    environment:
+      DATABASE_URL: postgresql://${DATABASE_USER:-grc_user}:${DATABASE_PASSWORD:-grc_password}@postgres:5432/${DATABASE_NAME:-grcdb}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      KEYCLOAK_SERVER_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-grc}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-grc-app}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-secret}
+      OLLAMA_API_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama2}
+      DEBUG: ${DEBUG:-False}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - grc-network
+
+  # React Frontend
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: grc-frontend
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-grc}
+      REACT_APP_KEYCLOAK_CLIENT: ${KEYCLOAK_CLIENT_ID:-grc-app}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+    command: npm start
+    networks:
+      - grc-network
+
+  # Ollama (AI/LLM Service)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: grc-ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - grc-network
+    profiles:
+      - ai
+
+volumes:
+  postgres_data:
+  redis_data:
+  keycloak_data:
+  ollama_data:
+
+networks:
+  grc-network:
+    driver: bridge
